@@ -343,6 +343,17 @@ export function attachCodexAppServerSession(
     onAgentEvent({ type: 'status', label: 'initializing', sessionId: id });
   }
 
+  /** Only the thread/start or thread/resume response selects this session's parent. */
+  function isSessionNotification(method: string, rawParams: unknown): boolean {
+    const params = isRecord(rawParams) ? rawParams : {};
+    // Codex v2 uses threadId except for thread/started, which carries a Thread.
+    // Optional/null threadId (for example a global warning) remains unscoped.
+    const notificationThreadId = method === 'thread/started'
+      ? (isRecord(params.thread) ? params.thread.id : undefined)
+      : params.threadId;
+    return typeof notificationThreadId !== 'string' || notificationThreadId === threadId;
+  }
+
   function handleFrame(frame: JsonObject): void {
     // Preserve archive replies after a terminal event, but never reopen a canceled turn.
     if (turnEnded || childClosed) return;
@@ -371,14 +382,13 @@ export function attachCodexAppServerSession(
       });
       return;
     }
+    if (!isSessionNotification(frame.method, frame.params)) return;
     if (frame.method === 'thread/started') {
+      if (!threadId) return;
       const params = isRecord(frame.params) ? frame.params : {};
       const thread = isRecord(params.thread) ? params.thread : null;
       const path = typeof thread?.path === 'string' ? thread.path : '';
       if (path) rolloutPath = path;
-      const startedId = typeof thread?.id === 'string' ? thread.id : '';
-      if (startedId && !threadId) threadId = startedId;
-      reportSessionHandle(startedId);
       return;
     }
     if (frame.method === 'turn/completed' && terminalReceived) return;

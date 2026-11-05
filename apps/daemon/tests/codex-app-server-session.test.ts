@@ -340,11 +340,13 @@ describe('codex app-server session', () => {
       expect(agentEvents).toContainEqual({ type: 'text_delta', delta: 'hi' });
     });
 
-    it('reports the thread id on the session-capture status channel', () => {
+    it('waits for the thread response before reporting the session-capture handle', () => {
       const { child, agentEvents } = harness();
       const init = child.sent('initialize');
       child.say({ jsonrpc: '2.0', id: init?.id, result: {} });
       child.say({ method: 'thread/started', params: { thread: { id: 'th-9' } } });
+      expect(agentEvents).not.toContainEqual(expect.objectContaining({ sessionId: 'th-9' }));
+      child.say({ id: child.sent('thread/start')?.id, result: { thread: { id: 'th-9' } } });
       expect(agentEvents).toContainEqual({
         type: 'status',
         label: 'initializing',
@@ -426,6 +428,128 @@ describe('codex app-server session', () => {
       const error = agentEvents.find((e) => e.type === 'error');
       expect(error).toBeDefined();
       expect(String(error?.message)).toContain('missing field');
+    });
+  });
+
+  describe('parent thread isolation', () => {
+    it.each([null, 'th-1'])('ignores child completion before parent completion (resume %s)', (resumeSessionId) => {
+      const { child, session, marks, agentEvents } = harness({ resumeSessionId });
+      completeHandshake(child);
+      const eventsBeforeChild = [...agentEvents];
+      child.say({ method: 'turn/completed', params: {
+        threadId: 'child-1', turn: { id: 'child-turn', status: 'completed', items: [] },
+      } });
+      expect(child.stdinEnded).toBe(0);
+      expect(session.completedSuccessfully()).toBe(false);
+      expect(marks).not.toContain('turn-complete');
+      expect(agentEvents).toEqual(eventsBeforeChild);
+      child.say({ method: 'item/agentMessage/delta', params: {
+        threadId: 'th-1', turnId: 'parent-turn', itemId: 'parent-message', delta: 'parent continues',
+      } });
+      expect(agentEvents).toContainEqual({ type: 'text_delta', delta: 'parent continues' });
+      const completion = { method: 'turn/completed', params: {
+        threadId: 'th-1', turn: { id: 'parent-turn', status: 'completed', items: [] },
+      } };
+      child.say(completion);
+      child.say(completion);
+      expect(child.stdinEnded).toBe(1);
+      expect(session.completedSuccessfully()).toBe(true);
+      expect(marks.filter(mark => mark === 'turn-complete')).toHaveLength(1);
+    });
+
+    it('does not let child start replace the parent path or session handle', () => {
+      const { child, session, agentEvents } = harness();
+      completeHandshake(child);
+      child.say({ method: 'thread/started', params: {
+        thread: { id: 'child-1', path: '/CODEX_HOME/child.jsonl' },
+      } });
+      expect(session.getDurableSessionId()).toBe('th-1');
+      expect(session.getLastSessionPath()).toBe('/CODEX_HOME/rollout.jsonl');
+      expect(agentEvents.filter(e => e.sessionId)).toEqual([
+        { type: 'status', label: 'initializing', sessionId: 'th-1' },
+      ]);
+      child.say({ method: 'thread/started', params: {
+        thread: { id: 'th-1', path: '/CODEX_HOME/parent-updated.jsonl' },
+      } });
+      expect(session.getLastSessionPath()).toBe('/CODEX_HOME/parent-updated.jsonl');
+    });
+
+    it.each([null, 'th-1'])('does not capture child start before the thread response (resume %s)', (resumeSessionId) => {
+      const { child, session, agentEvents } = harness({ resumeSessionId });
+      child.say({ id: child.sent('initialize')?.id, result: {} });
+      child.say({ method: 'thread/started', params: {
+        thread: { id: 'child-1', path: '/CODEX_HOME/child.jsonl' },
+      } });
+      expect(session.getDurableSessionId()).toBeNull();
+      expect(session.getLastSessionPath()).toBeNull();
+      expect(agentEvents).toEqual([]);
+      const open = child.sent('thread/start') ?? child.sent('thread/resume');
+      child.say({ id: open?.id, result: { thread: { id: 'th-1', path: '/CODEX_HOME/parent.jsonl' } } });
+      expect(session.getDurableSessionId()).toBe('th-1');
+      expect(session.getLastSessionPath()).toBe('/CODEX_HOME/parent.jsonl');
+      expect(agentEvents.filter(e => e.sessionId)).toEqual([
+        { type: 'status', label: 'initializing', sessionId: 'th-1' },
+      ]);
+    });
+
+    it('drops child output, items, usage, plans, warnings and errors before normalization', () => {
+      const { child, agentEvents, session } = harness();
+      completeHandshake(child);
+      const eventsBeforeChild = [...agentEvents];
+      const notifications = [
+        ['turn/started', { turn: { id: 'child-turn', status: 'inProgress', items: [] } }],
+        ['item/agentMessage/delta', { itemId: 'shared-id', delta: 'child output' }],
+        ['item/reasoning/summaryTextDelta', { itemId: 'reasoning', summaryIndex: 0, delta: 'child reasoning' }],
+        ['item/started', { item: { id: 'command', type: 'commandExecution', command: 'echo child', status: 'inProgress' } }],
+        ['item/completed', { item: { id: 'shared-id', type: 'agentMessage', text: 'child output' } }],
+        ['thread/tokenUsage/updated', { tokenUsage: { total: { inputTokens: 100, outputTokens: 20 } } }],
+        ['turn/plan/updated', { plan: [{ step: 'child work', status: 'inProgress' }] }],
+        ['warning', { message: 'child warning' }],
+        ['error', { willRetry: false, error: { message: 'child failed' } }],
+      ] as const;
+      for (const [method, params] of notifications) {
+        child.say({ method, params: { threadId: 'child-1', turnId: 'child-turn', ...params } });
+      }
+      expect(agentEvents).toEqual(eventsBeforeChild);
+      expect(session.stats()).toEqual({ unknownNotifications: 0, unknownItems: 0 });
+      child.say({ method: 'item/agentMessage/delta', params: {
+        threadId: 'th-1', turnId: 'parent-turn', itemId: 'shared-id', delta: 'parent output',
+      } });
+      expect(agentEvents).toContainEqual({ type: 'text_delta', delta: 'parent output' });
+    });
+
+    it.each(['failed', 'interrupted'])('preserves parent %s after child completion', (status) => {
+      const { child, session, agentEvents, marks } = harness();
+      completeHandshake(child);
+      if (status === 'interrupted') session.abort();
+      child.say({ method: 'turn/completed', params: {
+        threadId: 'child-1', turn: { id: 'child-turn', status: 'completed', items: [] },
+      } });
+      expect(child.stdinEnded).toBe(0);
+      expect(marks).not.toContain('turn-complete');
+      child.say({ method: 'turn/completed', params: {
+        threadId: 'th-1', turn: { id: 'parent-turn', status, items: [],
+          ...(status === 'failed' ? { error: { message: 'parent failed' } } : {}) },
+      } });
+      expect(child.stdinEnded).toBe(1);
+      expect(session.completedSuccessfully()).toBe(status !== 'failed');
+      expect(marks.filter(mark => mark === 'turn-complete')).toHaveLength(1);
+      if (status === 'failed') expect(agentEvents).toContainEqual({ type: 'error', message: 'parent failed' });
+    });
+
+    it('preserves unscoped warnings, control notifications and approval request replies', () => {
+      const { child, agentEvents, session } = harness();
+      completeHandshake(child);
+      child.say({ method: 'warning', params: { threadId: null, message: 'global warning' } });
+      expect(agentEvents.some(e => JSON.stringify(e).includes('global warning'))).toBe(true);
+      child.say({ method: 'account/rateLimits/updated', params: { rateLimits: {} } });
+      expect(session.stats().unknownNotifications).toBe(1);
+      child.say({ id: 9002, method: 'item/commandExecution/requestApproval', params: { threadId: 'child-1' } });
+      expect(child.frames().find(f => f.id === 9002)?.error?.code).toBe(-32601);
+      child.say({ id: child.sent('turn/start')?.id, result: { turn: { id: 'parent-turn' } } });
+      child.say({ method: 'item/agentMessage/delta', params: { itemId: 'unscoped', delta: 'legacy output' } });
+      expect(agentEvents).toContainEqual({ type: 'text_delta', delta: 'legacy output' });
+      expect(child.stdinEnded).toBe(0);
     });
   });
 
